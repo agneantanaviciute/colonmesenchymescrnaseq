@@ -1,0 +1,274 @@
+---
+title: '10X normalisation and cluster annotation'
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'norm_clust'
+  source_dir:
+    input: text
+    label: 'Input dataset'
+    value: 'data/HC_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit'
+  source_metadata:
+    input: text
+    label: 'Input metadata from cell detection script'
+    value: 'output/celldetection/10X_Ms_Healthy.RData'
+  proj_name:
+    input: text
+    label: 'Seurat dataset name'
+    value: '10X_Ms_DSS'
+  calc_jackstraw:
+    input: text
+    label: 'Calculate Jackstraw - takes 1hr'
+    value: 'no'
+  pcs_use:
+    input: numeric
+    lable: 'PCs to use for community detection'
+    value: 28
+  cluster_res:
+    input: numeric
+    label: 'Clustering resolution'
+    value: 1
+  tsne_pcs:
+    input: numeric
+    label: 'PCs for TSNE'
+    value: 28
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/",params$proj_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/",params$proj_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(colorspace)
+library(viridis)
+library(stats)
+library(scran)
+
+```
+
+# Dataset - `r params$proj_name`
+
+## Data import and setup
+
+### Load unfiltered UMI count matrix
+
+```{r import_raw}
+
+# Load the unfiltered healthy control dataset
+raw.data <- Read10X(params$source_dir)
+
+# Load the metadata from the cell detection script
+celldetect <- readRDS(params$source_metadata)
+
+```
+
+### Subset cells passing QC
+
+```{r subset_qc}
+
+qcpass.data <- raw.data[,rownames(celldetect$sc_metadata)[!celldetect$sc_metadata$qc_all]]
+
+dim(qcpass.data)
+
+```
+
+### Subset to remove control cells
+
+```{r subset_ctrl}
+
+qcpass.data <- qcpass.data[,!colnames(qcpass.data) %in% celldetect$ctrl_bcs]
+
+dim(qcpass.data)
+
+```
+
+### Construct Seurat object with metadata
+
+```{r build_seurat}
+sc_meta <- celldetect$sc_metadata[colnames(qcpass.data),]
+
+# Initialize the Seurat object
+sc <- new("seurat", raw.data = qcpass.data)
+
+# Setup Seurat object, apply gene filter (cell filter already done during cell detection)
+sc <- Setup(sc, min.cells = 3, min.genes = 200, do.logNormalize = T, 
+            total.expr = 1e4, project = params$proj_name, meta.data = sc_meta)
+
+# Dataset dimensions post filter
+print(paste(dim(sc@data)[1], "genes"))
+print(paste(dim(sc@data)[2], "cellular GEMs"))
+
+```
+
+## Normalisation
+
+### Determine variable genes
+
+```{r variable_genes}
+
+#Identify variable genes
+sc <- MeanVarPlot(sc ,fxn.x = expMean, fxn.y = logVarDivMean, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, do.contour = F)
+print(paste(length(sc@var.genes), "variable genes"))
+
+```
+
+
+### Calculate cell cycle scores
+
+```{r cell_cycle}
+
+# Get pre-trained marker sets
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+
+# Get the expression data matrix
+cc_mat <- as.matrix(sc@data)
+
+# Switch gene ids to ensembl to match pre-trained set
+ms_ensembl <- read.table(paste0(params$source_dir,"/genes.tsv"),
+                         header = FALSE, sep = "\t", quote = "", stringsAsFactors = FALSE)
+cc_ensembl <- sapply(rownames(cc_mat), function(x) ms_ensembl$V1[ms_ensembl$V2==x][1])
+
+# Cell cycle anotation using the cyclone pairs method
+cyc <- cyclone(cc_mat, mm.pairs, gene.names=cc_ensembl, verbose = TRUE)
+
+# Add back to Seurat object
+for(scr in colnames(cyc$scores)) {
+  sc@data.info[[scr]] <- cyc$scores[[scr]]
+  sc@data.info[[paste0("norm_",scr)]] <- cyc$normalized.scores[[scr]]
+}
+
+sc@data.info[["phases"]] <- cyc$phases
+
+```
+
+### Regress out unwanted variation
+
+```{r regress_out}
+
+#Regress out unwanted variation
+sc <- RegressOut(sc, latent.vars = c("nUMI","batch","G2M","G1"), 
+                        genes.regress = sc@var.genes, model.use = "negbinom")
+
+```
+
+## Dimension reduction
+
+### PCA
+
+```{r PCA}
+
+#Linear dimension reduction
+sc <- PCA(sc, pc.genes = sc@var.genes, do.print = FALSE, pcs.store = 50)
+sc <- ProjectPCA(sc, do.print = FALSE)
+
+```
+
+### PC evaluation - Scree plot
+
+```{r PC_scree, fig.width = 4, fig.height=3}
+
+p1 <- PCElbowPlot(sc, num.pc = 50)
+
+# Fit line for the last 10 (presumed non-significant) PCs to aid interpretation
+bf <- lm(sdev ~ pc, data = p1$data[40:50,])
+summary(bf)
+
+p1 + geom_abline(intercept = bf$coefficients[1], slope = bf$coefficients[2], linetype = "dashed") + 
+  geom_vline(xintercept = params$pcs_use, linetype = "dotted")
+
+```
+
+### PC evaluation - permutation test
+
+```{r PC_permutation}
+
+if(file.exists(paste0("output/",params$script_name,"/",params$proj_name,"/sc_jackstraw.RData")) & params$calc_jackstraw == "no") {
+  sc <- readRDS(file = paste0("output/",params$script_name,"/",params$proj_name,"/sc_jackstraw.RData"))
+} else {
+  sc <- JackStraw(sc, num.replicate = 100, do.print = TRUE, num.pc = 50)
+  saveRDS(sc, file = paste0("output/",params$script_name,"/",params$proj_name,"/sc_jackstraw.RData"))
+}
+
+```
+
+```{r PC_permutation_plot, fig.width=4, fig.height=3}
+
+# Sample plots of tested PCs
+JackStrawPlot(sc, PCs = paste0("PC",seq(1, 50, by = 6)), plot.y.lim = 1.0, score.thresh = 1e-05)
+
+# Calculate overall p-values for PCs
+score.thresh <- 1e-05
+pc.score <- sapply(1:50, function(x) {
+  prop.test(c(length(which(sc@jackStraw.empP[, x] <= score.thresh)), floor(nrow(sc@jackStraw.empP) * score.thresh)), c(nrow(sc@jackStraw.empP), nrow(sc@jackStraw.empP)))$p.val
+})
+
+ggplot(data = data.frame(PC = 1:50, pval = -log10(pc.score)), aes(x=PC, y=pval)) + geom_col() + labs(y="-log10(p value)") +
+  geom_vline(xintercept = params$pcs_use, linetype = "dotted")
+
+```
+
+### PC evaluation - inspection
+
+```{r PC_heatmap}
+
+for(i in seq(1, 50, by = 6)) {
+  print(PCHeatmap(sc, pc.use = i, cells.use = 100, do.balanced = TRUE, labCol = NA, col.use = viridis(75)))
+}
+
+```
+
+### Graph-based clustering
+
+```{r final_clust, cache=FALSE}
+
+print(paste0("PCs used for clustering - 1:",params$pcs_use))
+print(paste0("Clustering resolution: ",params$cluster_res))
+
+sc <- FindClusters(sc, pc.use = 1:params$pcs_use, 
+                   resolution = params$cluster_res, 
+                   print.output = FALSE, save.SNN = TRUE, plot.SNN = FALSE)
+
+```
+
+```{r calc_tsne, cache=FALSE}
+
+print(paste0("PCs used for TSNE - 1:",params$tsne_pcs))
+
+sc <- RunTSNE(sc, dims.use = 1:params$tsne_pcs, do.fast = T)
+
+```
+
+```{r plot_TSNE, cache=FALSE}
+
+TSNEPlot(sc, do.label = T, pt.size = 0.5, do.return = TRUE)
+
+```
+
+### Save out control cell barcodes
+
+```{r save_data, cache = FALSE}
+  
+saveRDS(sc, file = paste0("output/",params$script_name,"/",params$proj_name,"/sc_clustered.RData"))
+
+```
+

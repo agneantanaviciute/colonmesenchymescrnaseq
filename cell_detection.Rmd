@@ -1,0 +1,373 @@
+---
+title: '10X cell detection and control cell discrimination'
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'celldetection'
+  source_dir:
+    input: text
+    label: 'Input dataset'
+    value: 'data/HC_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit'
+  cells_expected:
+    input: integer
+    label: 'Expected cell count'
+    value: 4500
+  min_UMI:
+    input: integer
+    label: 'Minimum UMI for cell detection'
+    value: 2500
+  proj_name:
+    input: text
+    label: 'Seurat dataset name'
+    value: '10X_Ms_Healthy'
+  ctrl_cell_clust:
+    input: integer
+    label: 'Control cell cluster number'
+    value: 7
+  batch_prefix:
+    input: text
+    label: 'Batch annotation prefix'
+    value: 'HC'
+  qc_gene:
+    input: integer
+    label: 'Minimum genes detected'
+    value: 1000
+  qc_UMI:
+    input: integer
+    label: 'Total UMI counts. Within cluster number of MADs to identify outliers'
+    value: 5
+  qc_mito:
+    input: integer
+    label: 'Mitochondrial read fraction. Within cluster number of MADs to identify outliers'
+    value: 5
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/",params$proj_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/",params$proj_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(colorspace)
+library(viridis)
+library(stats)
+
+```
+
+# Dataset - `r params$proj_name`
+
+## Data import and inspection
+
+### Load unfiltered UMI count matrix
+
+```{r import_raw}
+
+# Load the unfiltered healthy control dataset
+raw.data <- Read10X(params$source_dir)
+raw.data[1:3,1:3]
+
+print(paste(dim(raw.data)[1], "genes"))
+print(paste(dim(raw.data)[2], "possible GEM barcodes"))
+
+```
+
+### Identify cellular GEMs
+
+```{r cell_calling}
+
+# Calculate gene and UMI counts for each cell
+nUMI <- colSums(raw.data)
+nGenes <- colSums(raw.data > 0)
+
+# 10X cell calling algorithm
+top_barcodes <- nUMI[order(nUMI, decreasing = TRUE)][1:params$cells_expected] # Select top n barcodes by UMI count, where n is expected cell number
+maxUMI <- quantile(top_barcodes, probs = 0.99) # 'robust' estimate of maximum UMI, 99th percentile
+thr_10x <- maxUMI/10 # Set cut-off 1 order of magnitude lower
+
+print(paste("10X threshold for calling a cellular GEM:", thr_10x, "UMIs"))
+
+```
+
+### Evaluate 10X cell calling in this dataset
+
+```{r umi_density, fig.width=8, fig.height=6}
+
+# Set a manual threshold based on inspection of the bimodal nUMI density plot (1st local minimum)
+min_UMI <- params$min_UMI
+
+# Cell numbers by threshold
+ncells_manual <- sum(nUMI > min_UMI)
+ncells_10x <- sum(nUMI > thr_10x)
+
+p1 <- ggplot(data = data.frame(nUMI = nUMI[nUMI > 250])) + 
+  geom_density(aes(x = nUMI, y = ..scaled..), fill = rainbow_hcl(1), alpha = 0.3, adjust = 0.5) +
+  coord_cartesian(xlim = c(0,20000)) +
+  geom_vline(xintercept = c(min_UMI,thr_10x), linetype = c("dashed","dotted")) +
+  annotate(geom="text", x=min_UMI + 100, y=0.75, 
+           label=paste("1st local minimum -", ncells_manual,"cells"), 
+           angle = 90, hjust = 0.5, vjust = 1) +
+  annotate(geom="text", x=thr_10x + 100, y=0.75, 
+           label=paste("10X cell detection -", ncells_10x,"cells"), 
+           angle = 90, hjust = 0.5, vjust = 1) +
+  labs(y = "scaled density", title = paste(params$proj_name, "cellular barcodes, total UMI counts"), 
+       subtitle = "6,000 cells expected") +
+  theme_bw()
+
+p1
+
+```
+
+### Unique genes detected, comparison of thresholding methods
+
+```{r ngenes_per_barcode, fig.width=8, fig.height=6}
+
+gene_df <- data.frame(nGenes = nGenes, cell_bc_10x = nUMI > thr_10x, cell_bc_man = nUMI > min_UMI)
+
+p2 <- list()
+p2[[1]] <- ggplot(data = gene_df[gene_df$nGenes > 200,]) + 
+  geom_density(aes(x = nGenes, fill = cell_bc_10x), alpha = 0.3, adjust = 0.5) +
+  scale_fill_manual(values = rainbow_hcl(2), name = "Cellular GEM") +
+  coord_cartesian(ylim = c(0,0.004)) +
+  labs(title = "Unique genes detected", subtitle = "Cellular vs Non-cellular GEMs, 10X threshold") +
+  theme_bw() +
+  theme(legend.justification=c(1,1), legend.position=c(1,1))
+
+p2[[2]] <- ggplot(data = gene_df[gene_df$nGenes > 200,]) + 
+  geom_density(aes(x = nGenes, fill = cell_bc_man), alpha = 0.3, adjust = 0.5) +
+  scale_fill_manual(values = rainbow_hcl(2), name = "Cellular GEM") +
+  coord_cartesian(ylim = c(0,0.004)) +
+  labs(title = "Unique genes detected", subtitle = "Cellular vs Non-cellular GEMs, 1st local minimum") +
+  theme_bw() +
+  theme(legend.justification=c(1,1), legend.position=c(1,1))
+
+MultiPlotList(p2, cols = 2)
+
+```
+
+## Detection of control cells
+
+### Dimension reduction - Variable genes
+
+```{r initial_seurat}
+
+# Initialize the Seurat object using the manually determined UMI threshold to identify cellular GEMs
+sc <- new("seurat", raw.data = raw.data[,nUMI > min_UMI])
+
+# Keep all genes expressed in >= 3 cells, keep all cells with >= 200 genes
+# Perform log-normalization, first scaling each cell to a total of 1e4 molecules (as in Macosko et al. Cell 2015)
+sc <- Setup(sc, min.cells = 3, min.genes = 200, do.logNormalize = T, 
+            total.expr = 1e4, project = params$proj_name)
+
+# Dataset dimensions post filter
+print(paste(dim(sc@data)[1], "genes"))
+print(paste(dim(sc@data)[2], "cellular GEMs"))
+
+# Annotate cells in which blasticidin resistance gene was detected (controls)
+sc <- AddMetaData(sc, sc@raw.data["pL63_blaR",] > 1, "blastR")
+
+#Identify variable genes
+sc <- MeanVarPlot(sc ,fxn.x = expMean, fxn.y = logVarDivMean, x.low.cutoff = 0.0125, x.high.cutoff = 4, y.cutoff = 0.5, do.contour = F)
+print(paste(length(sc@var.genes), "variable genes"))
+
+```
+
+### Dimension reduction - PCA
+
+```{r initial_PCA}
+
+#Linear dimension reduction
+sc <- PCA(sc, pc.genes = sc@var.genes, do.print = FALSE)
+sc <- ProjectPCA(sc, do.print = FALSE)
+
+```
+
+```{r initial_plot_PCs, fig.width=6, fig.height=6}
+
+#Examine PCs
+p3 <- PCAPlot(sc, 1, 2, pt.size = 1, group.by = "blastR", do.return = TRUE)
+p3$layers[[1]]$aes_params$alpha <- 0.3
+
+p3 + 
+  scale_alpha_manual(values = c(0.2)) +
+  labs(title = "Dimensionality reduction, PC1 vs PC2", subtitle = "Grouping variable: Blasticidin resistance gene expression")
+
+```
+
+### Graph-based clustering
+
+```{r initial_clust}
+
+sc <- FindClusters(sc, pc.use = 1:10, resolution = 0.6, print.output = 0, save.SNN = T)
+sc <- RunTSNE(sc, dims.use = 1:10, do.fast = T)
+
+```
+
+```{r initial_TSNE}
+
+p4 <- TSNEPlot(sc, do.label = T, pt.size = 0.5, do.return = TRUE)
+p4
+
+```
+
+### Control cell annotation
+
+```{r ctrl_cell_TSNE}
+
+FeaturePlot(sc, c("pL63_blaR","Ptprc","Cd68","Cd14"), cols.use = c("grey","blue"))
+
+```
+
+```{r ctrl_cell_violins}
+
+VlnPlot(sc,c("pL63_blaR","Ptprc","Cd68","Cd14"), use.raw = T)
+
+```
+
+```{r ctrl_cell_metrics}
+
+# Further annotation - mitochondrial percentage, batch
+mito.genes <- grep("^mt-", rownames(sc@data), value = T)
+percent.mito <- colSums(expm1(sc@data[mito.genes, ]))/colSums(expm1(sc@data))
+
+sc <- AddMetaData(sc, percent.mito, "percent.mito")
+sc <- AddMetaData(sc, as.factor(sapply(colnames(sc@data), function(x) paste0(params$batch_prefix,substr(x,nchar(x),nchar(x))))), "batch")
+
+VlnPlot(sc,c("nUMI"), use.raw = T, size.use = 0.1)
+VlnPlot(sc,c("nGene"), use.raw = T, size.use = 0.1)
+VlnPlot(sc,c("percent.mito"), use.raw = T, size.use = 0.1)
+
+```
+
+### Rerun cell-ranger cell detection without control cells
+
+```{r recalc_cellranger, cache = FALSE}
+ctrl_bcs <- colnames(sc@data)[sc@data.info$res.0.6==params$ctrl_cell_clust]
+
+print(paste("Control cells detected:", length(ctrl_bcs)))
+print(paste("Control cells expected (5% total):", dim(sc@data)[2]*0.05))
+
+nUMI_noCtrl <- nUMI[!colnames(raw.data) %in% ctrl_bcs]
+
+# 10X cell calling algorithm
+top_barcodes_noCtrl <- nUMI_noCtrl[order(nUMI_noCtrl, decreasing = TRUE)][1:4500] # 4,500 cells expected
+maxUMI_noCtrl <- quantile(top_barcodes_noCtrl, probs = 0.99) # 'robust' estimate of maximum UMI, 99th percentile
+thr_10x_noCtrl <- maxUMI_noCtrl/10 # Set cut-off 1 order of magnitude lower
+
+print(paste("Corrected 10X threshold for calling a cellular GEM:", thr_10x_noCtrl, "UMIs"))
+ncells_10x_corr <- sum(nUMI > thr_10x_noCtrl)
+
+p1 + geom_vline(xintercept = thr_10x_noCtrl, linetype="twodash") +
+  annotate(geom="text", x=thr_10x_noCtrl + 100, y=0.75, 
+           label=paste("Corrected 10X -", ncells_10x_corr,"cells"), 
+           angle = 90, hjust = 0.5, vjust = 1)
+```
+
+### Detect multiplets and low quality cells
+
+```{r qc_cluster}
+outlier_mad <- function(x, n_mad) {
+   medn <- median(x)
+   sigma1 <- medn - n_mad * mad(x)
+   sigma2 <- medn + n_mad * mad(x)
+   return(c(y=medn,ymin=max(sigma1,0),ymax=sigma2))
+}
+
+clust_batch <- paste(as.character(sc@ident), sc@data.info$batch, sep = "_")
+names(clust_batch) <- row.names(sc@data.info)
+sc <- AddMetaData(sc, clust_batch , "clust_batch")
+
+sc <- StashIdent(sc, save.name = "InitialClust")
+
+```
+
+```{r qc_violins}
+
+p6 <- VlnPlot(sc,c("nUMI","percent.mito"), use.raw = T, size.use = 0.1, group.by = "ident", do.ret = TRUE)
+p6[[1]] + stat_summary(fun.data = "outlier_mad", fun.args = list(n_mad = params$qc_UMI), geom = "crossbar", width = 0.5) + 
+  theme(axis.text.x = element_text(size = 18), axis.text.y = element_text(size = 18, hjust = 0.5), axis.title.x = element_text(size = 18))
+p6[[2]] + stat_summary(fun.data = "outlier_mad", fun.args = list(n_mad = params$qc_mito), geom = "crossbar", width = 0.5) +
+  theme(axis.text.x = element_text(size = 18), axis.text.y = element_text(size = 18, hjust = 0.5), axis.title.x = element_text(size = 18))
+
+```
+
+```{r qc_metadata}
+
+qc_fail <- sapply(levels(sc@ident), function(x) {
+  UMI_stats <- outlier_mad(sc@data.info$nUMI[sc@ident==x], n_mad = params$qc_UMI)
+  mto_stats <- outlier_mad(sc@data.info$percent.mito[sc@ident==x], n_mad = params$qc_mito)
+  res <- matrix(TRUE, nrow = nrow(sc@data.info[sc@ident==x,]), ncol = 4)
+  rownames(res) <- rownames(sc@data.info[sc@ident==x,])
+  colnames(res) <- c("qc_gene","qc_UMI","qc_mito","qc_all")
+  res[sc@data.info$nGene[sc@ident==x] > params$qc_gene, "qc_gene"] <- FALSE
+  res[sc@data.info$nUMI[sc@ident==x] < UMI_stats["ymax"] & 
+            sc@data.info$nUMI[sc@ident==x] > UMI_stats["ymin"], "qc_UMI"] <- FALSE
+  res[sc@data.info$percent.mito[sc@ident==x] < mto_stats["ymax"] & 
+            sc@data.info$percent.mito[sc@ident==x] > mto_stats["ymin"], "qc_mito"] <- FALSE
+  res[,"qc_all"] <- apply(res[,1:3], 1, any) 
+  res
+})
+
+qc_fail <- do.call("rbind", qc_fail)
+qc_fail <- qc_fail[rownames(sc@data.info),]
+qc_fail <- data.frame(qc_fail)
+
+sapply(names(qc_fail), function(x) table(qc_fail[[x]]))
+
+for(qc_name in names(qc_fail)) sc@data.info[[qc_name]] <- qc_fail[[qc_name]]
+
+```
+
+```{r qc_tsne}
+p7 <- DimPlot(sc, reduction.use = "tsne", group.by = "qc_all", pt.size = 1, do.return = TRUE)
+p7$layers[[1]]$aes_params$alpha <- 0.5
+p7 + labs(title = "Cells failing QC", subtitle = paste0(sum(sc@data.info$qc_all), " of ",
+                                                        nrow(sc@data.info), " cells (", 
+                                                        round(100*sum(sc@data.info$qc_all)/nrow(sc@data.info),2),
+                                                        "%)"))
+```
+
+### Batch (channel) effects
+
+```{r init_tsne_batch}
+
+p5 <- DimPlot(sc, reduction.use = "tsne", group.by = "batch", pt.size = 1, do.return = TRUE)
+p5$layers[[1]]$aes_params$alpha <- 0.7
+p5
+
+```
+
+### Save out control cell barcodes
+
+```{r save_data, cache = FALSE}
+
+sc_metadata <- sc@data.info[,6:ncol(sc@data.info)]
+objects_to_save <- c("params","ncells_manual","ctrl_bcs","sc_metadata")
+save_list <- list()
+
+for(x in objects_to_save) {
+    save_list[[x]] <- get(x)
+}
+  
+saveRDS(save_list, file = paste0("output/",params$script_name,"/",params$proj_name,".RData"))
+
+```
+

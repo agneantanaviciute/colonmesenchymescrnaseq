@@ -1,0 +1,214 @@
+---
+title: "10X examination of channel effects using control cells"
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'ctrlcells'
+  data1:
+    input: text
+    label: 'Seurat dataset 1 name'
+    value: '10X_Ms_Healthy'
+  data2:
+    input: text
+    label: 'Seurat dataset 2 name'
+    value: '10X_Ms_DSS'
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(scran)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(cowplot)
+library(colorspace)
+
+source("seurat_functions.R")
+
+```
+
+# Load data
+
+```{r load_data}
+
+hc_celldt <- readRDS(file = "output/celldetection/10X_Ms_Healthy.RData")
+dss_celldt <- readRDS(file = "output/celldetection/10X_Ms_DSS.RData")
+
+hc_raw <- Read10X("data/HC_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit")
+dss_raw <- Read10X("data/DSS_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit")
+
+identical(rownames(hc_raw), rownames(dss_raw))
+
+```
+
+# Subset data to cells including controls
+
+```{r subset_raw}
+
+# Healthy
+h_clust <- rep("Healthy",length(hc_celldt$ctrl_bcs))
+hc_raw <- hc_raw[,hc_celldt$ctrl_bcs]
+colnames(hc_raw) <- paste0(colnames(hc_raw),".H")
+
+# DSS
+d_clust <- rep("DSS",length(dss_celldt$ctrl_bcs))
+dss_raw <- dss_raw[,dss_celldt$ctrl_bcs]
+colnames(dss_raw) <- paste0(colnames(dss_raw),".D")
+
+```
+
+# Make seurat object with combined data
+
+```{r build_seurat}
+
+comb_raw <- cbind(hc_raw,dss_raw)
+
+# Initialize the Seurat object
+sc <- new("seurat", raw.data = comb_raw)
+
+# Setup Seurat object, apply gene filter (cell filter already done during cell detection)
+sc <- Setup(sc, min.cells = 3, min.genes = 200, do.logNormalize = T, 
+            total.expr = 1e4, project = "10X Ms Ctrls", do.scale = F, do.center = F)
+
+sc@data.info$condition <- c(h_clust,d_clust)
+sc@data.info$batch.id <- factor(substring(colnames(sc@data),nchar(colnames(sc@data))-2,nchar(colnames(sc@data))),
+                                levels = c("1.H","2.H","3.H","1.D","2.D","3.D"))
+sc <- SetIdent(sc,ident.use = sc@data.info$batch.id)
+
+```
+
+# Compare total UMIs
+
+```{r totUMI, fig.width=4, fig.height=4}
+
+ggplot(data = sc@data.info, aes(x = batch.id, y = nUMI, col = batch.id)) + 
+  geom_jitter() + geom_hline(yintercept = c(1e4,1e5), linetype = c("dashed","dotted")) +
+  ggtitle("Control cell QC") + xlab("Batch / Channel") + theme_bw() + theme(legend.position = "none")
+
+sc <- SubsetData(sc, cells.use = colnames(sc@data)[sc@data.info$nUMI > 1e4 & sc@data.info$nUMI < 1e5])
+
+ggplot(data = sc@data.info, aes(x = batch.id, y = nUMI, fill = batch.id)) + geom_boxplot(alpha = 0.7) + 
+  ggtitle("Control cell UMI counts by channel") + xlab("Batch / Channel") + theme_bw() + theme(legend.position = "none")
+
+```
+
+# Regress out UMI and annotate cell cycle stage
+
+```{r anno_regress, fig.width=5, fig.height=4}
+
+# Identify variable genes
+sc <- MeanVarPlot(sc ,fxn.x = expMean, fxn.y = logVarDivMean, x.low.cutoff = 0.0125, x.high.cutoff = 4, y.cutoff = 0.5, do.contour = F)
+print(paste(length(sc@var.genes), "variable genes"))
+
+# Identify cell cycle stage
+# Get pre-trained marker sets
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+
+# Get the expression data matrix
+cc_mat <- as.matrix(sc@data)
+
+# Switch gene ids to ensembl to match pre-trained set
+ms_ensembl <- read.table("data/HC_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit/genes.tsv",
+                         header = FALSE, sep = "\t", quote = "", stringsAsFactors = FALSE)
+cc_ensembl <- sapply(rownames(cc_mat), function(x) ms_ensembl$V1[ms_ensembl$V2==x][1])
+
+# Cell cycle anotation using the cyclone pairs method
+cyc <- cyclone(cc_mat, mm.pairs, gene.names=cc_ensembl, verbose = TRUE)
+
+# Add back to Seurat object
+for(scr in colnames(cyc$scores)) {
+  sc@data.info[[scr]] <- cyc$scores[[scr]]
+  sc@data.info[[paste0("norm_",scr)]] <- cyc$normalized.scores[[scr]]
+}
+
+sc@data.info[["phases"]] <- cyc$phases
+
+ggplot(data=sc@data.info[,c("G1","G2M","phases")], aes(x=G1,y=G2M,fill=phases)) + 
+  geom_point(pch = 21, size = 4, alpha = 0.7) +
+  xlim(c(0,1)) +
+  ylim(c(0,1)) +
+  geom_segment(aes(x = 0.5, y = 0, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0, y = 0.5, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 1, yend = 1)) +
+  annotate("text", x = 0.4, y = 0.4, label = "S") +
+  annotate("text", x = 0.5, y = 0.6, label = "G2/M") +
+  annotate("text", x = 0.6, y = 0.5, label = "G0/G1") +
+  ggtitle("Control cell cell cycle score")
+
+```
+
+## Regress out nUMI
+
+```{r regress_nUMI, fig.width=5, fig.height=4}
+
+#Regress out unwanted variation
+sc <- RegressOut(sc, latent.vars = c("nUMI"), 
+                        genes.regress = sc@var.genes, model.use = "negbinom")
+
+#Linear dimension reduction
+sc <- PCA(sc, pc.genes = sc@var.genes, do.print = FALSE, pcs.store = 50)
+sc <- ProjectPCA(sc, do.print = FALSE)
+
+PCAPlot(sc, pt.size = 2, do.return = TRUE) + ggtitle("PCA by batch") + theme_bw() + theme(legend.title = element_blank())
+PCAPlot(sc, group.by = "condition", pt.size = 2, do.return = TRUE) + ggtitle("PCA by condition") + theme_bw() + theme(legend.title = element_blank())
+
+```
+
+```{r cc_pca, fig.width=4, fig.height=4}
+
+FeaturePlot(sc, "G2M", reduction.use = "pca", pt.size = 3, cols.use = c("lightgrey","blue"))
+
+```
+
+## Regress out nUMI and cell cycle
+
+```{r regress_nUMI_cc, fig.width=6, fig.height=6}
+
+#Regress out unwanted variation
+sc <- RegressOut(sc, latent.vars = c("nUMI","G2M","G1"), 
+                        genes.regress = sc@var.genes, model.use = "negbinom")
+
+#Linear dimension reduction
+sc <- PCA(sc, pc.genes = sc@var.genes, do.print = FALSE, pcs.store = 50)
+sc <- ProjectPCA(sc, do.print = FALSE)
+
+pairs(sc@pca.rot[,1:5], col = rainbow_hcl(6)[sc@ident], pch = 20)
+pairs(sc@pca.rot[,1:5], col = rainbow_hcl(2)[as.factor(sc@data.info$condition)], pch = 20)
+
+pc4top <- sc@pca.x[order(abs(sc@pca.x[,4]), decreasing = TRUE),][1:10,]
+data.frame(gene = rownames(pc4top), weight = pc4top[,4])
+
+```
+
+## Examine expression of genes causing batch effect
+
+```{r batch_effect_genes, fig.width = 6, fig.height=2.5}
+
+ds <- readRDS("output/cluster_biology.RData")
+
+FeaturePlot(ds$sc_hc,c("Ereg","Saa3","Cxcl5"),nCol = 3, cols.use = c("lightgrey","blue"), no.axes = TRUE)
+FeaturePlot(ds$sc_dss,c("Ereg","Saa3","Cxcl5"),nCol = 3, cols.use = c("lightgrey","blue"), no.axes = TRUE)
+
+```
+

@@ -1,0 +1,357 @@
+---
+title: "10X Ontology Enrichment and Differential Expression Setup"
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'ont_DE'
+  data1:
+    input: text
+    label: 'Seurat dataset 1 name'
+    value: '10X_Ms_Healthy'
+  data2:
+    input: text
+    label: 'Seurat dataset 2 name'
+    value: '10X_Ms_DSS'
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(dplyr)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Mm.eg.db)
+library(DOSE)
+library(xlsx)
+library(ggplot2)
+library(viridis)
+library(cowplot)
+library(colorspace)
+library(matrixStats)
+
+source("seurat_functions.R")
+
+```
+
+# Load data
+
+```{r load_data}
+
+ds <- readRDS("output/cluster_biology.RData")
+
+ms_ids <- read.table("data/HC_3L/raw_gene_bc_matrices_mex/mm10_pL63_mCit/genes.tsv", header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+colnames(ms_ids) <- c("ensembl","symbol")
+
+```
+
+# Find markers for non-fibroblast cell types
+
+```{r hc_markers}
+
+ds$sc_hc <- SetIdent(ds$sc_hc, ident.use = ds$sc_hc@data.info$clust_names)
+hc_allmarkers <- FindAllMarkers(ds$sc_hc, thresh.use = 0.25, min.pct = 0.25, return.thresh = 0.3, test.use = "roc")
+
+```
+
+```{r dss_markers}
+
+ds$sc_dss <- SetIdent(ds$sc_dss, ident.use = ds$sc_dss@data.info$clust_names)
+dss_allmarkers <- FindAllMarkers(ds$sc_dss, thresh.use = 0.25, min.pct = 0.25, return.thresh = 0.3, test.use = "roc")
+
+```
+
+```{r non_flc_markers}
+
+non_flc <- c("Epithelial","Sm mus/ICC","Pericyte","Endothelial","Lymphatic","Glial","Immune")
+
+hc_posmarkers <- hc_allmarkers[hc_allmarkers$avg_diff > 0,]
+
+nonflc.markers <- hc_posmarkers %>% group_by(cluster) %>% dplyr::arrange(desc(myAUC), .by_group = TRUE) %>% dplyr::filter(row_number() <= 100 | myAUC > 0.75)
+
+nonflc_ids <- sapply(levels(as.factor(nonflc.markers$cluster)), function(x) {
+  ms_ids[ms_ids$symbol %in% (nonflc.markers[nonflc.markers$cluster==x,] %>% .$gene), "ensembl"]
+})
+
+nonflc_ids <- nonflc_ids[names(nonflc_ids) %in% non_flc]
+
+ensembl_universe <- ms_ids[ms_ids$symbol %in% rownames(ds$sc_hc@data), "ensembl"]
+
+# Compare module ontology
+mods_nonflc <- compareCluster(
+  nonflc_ids,
+  fun = "enrichGO",
+  universe = ensembl_universe,
+  OrgDb = org.Mm.eg.db, 
+  keyType = "ENSEMBL", 
+  ont = "BP", 
+  minGSSize = 50,
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.01, 
+  qvalueCutoff = 0.05
+)
+
+```
+
+```{r non_flc_dot}
+
+subset_nonflc <- c("anion transport","digestive system process","regulation of pH","muscle contraction","regulation of muscle system process","muscle cell development","angiogenesis","endothelial cell differentiation","regulation of endothelial cell migration","regulation of leukocyte migration","endocytosis","gliogenesis","glial cell differentiation","T cell differentiation","immune effector process")
+
+mods_nonflc_subset <- dropGO(mods_nonflc, 
+                             term = mods_nonflc@compareClusterResult$ID[!mods_nonflc@compareClusterResult$Description %in% subset_nonflc])
+
+dotplot(mods_nonflc_subset, showCategory = 20) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# Construct marker lists for enrichment
+
+```{r mark_lists_hc}
+
+flc.markers <- ds$flc.markers0
+flc.markers <- flc.markers %>% group_by(cluster) %>% top_n(100,power)
+
+hc_ids <- sapply(levels(as.factor(flc.markers$cluster)), function(x) {
+  ms_ids[ms_ids$symbol %in% (flc.markers[flc.markers$cluster==x,] %>% .$gene), "ensembl"]
+})
+
+names(hc_ids) <- plyr::mapvalues(names(hc_ids), from = "Myofibroblast", to = "MF", warn_missing = FALSE)
+
+ensembl_universe <- ms_ids[ms_ids$symbol %in% rownames(ds$sc_hc@data), "ensembl"]
+
+# Compare module ontology
+mods_flc <- compareCluster(
+  hc_ids,
+  fun = "enrichGO",
+  universe = ensembl_universe,
+  OrgDb = org.Mm.eg.db, 
+  keyType = "ENSEMBL", 
+  ont = "BP", 
+  minGSSize = 50,
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.01, 
+  qvalueCutoff = 0.05
+)
+
+```
+
+```{r hc_dotplots1, fig.height=6, fig.width=9}
+subset_ont <- c("muscle contraction","actin filament organization","muscle system process","muscle cell development","cellular response to transforming growth factor beta stimulus","SMAD protein signal transduction","negative regulation of Wnt signaling pathway","BMP signaling pathway","developmental cell growth","inflammatory response","positive regulation of cell adhesion","positive regulation of cytokine production","icosanoid metabolic process","I-kappaB kinase/NF-kappaB signaling","positive regulation of fibroblast proliferation","ameboidal-type cell migration","regulation of JAK-STAT cascade","cytokine secretion","phagocytosis","canonical Wnt signaling pathway","positive regulation of Wnt signaling pathway")
+
+mods_flc_subset <- dropGO(mods_flc, term = mods_flc@compareClusterResult$ID[!mods_flc@compareClusterResult$Description %in% subset_ont])
+dotplot(mods_flc_subset, showCategory = 20)
+
+```
+
+```{r hc_dotplots2, fig.height=4, fig.width=7}
+subset_all <- c("epithelial cell proliferation","response to growth factor","epithelial cell differentiation","positive regulation of cell migration","cell-substrate adhesion","extracellular matrix organization","Response to growth factor")
+
+mods_flc_all <- dropGO(mods_flc, term = mods_flc@compareClusterResult$ID[!mods_flc@compareClusterResult$Description %in% subset_all])
+dotplot(mods_flc_all, showCategory = 20)
+
+
+```
+
+```{r mark_lists_dss}
+
+dss.markers <- ds$dss.markers0
+dss.markers <- dss.markers %>% group_by(cluster) %>% top_n(100,power)
+
+dss_ids <- sapply(levels(as.factor(dss.markers$cluster)), function(x) {
+  ms_ids[ms_ids$symbol %in% (dss.markers[dss.markers$cluster==x,] %>% .$gene), "ensembl"]
+})
+
+names(dss_ids) <- plyr::mapvalues(names(dss_ids), from = "Myofibroblast", to = "MF", warn_missing = FALSE)
+
+ensembl_universe <- ms_ids[ms_ids$symbol %in% rownames(ds$sc_hc@data), "ensembl"]
+
+# Compare module ontology
+mods_dss <- compareCluster(
+  dss_ids,
+  fun = "enrichGO",
+  universe = ensembl_universe,
+  OrgDb = org.Mm.eg.db, 
+  keyType = "ENSEMBL", 
+  ont = "BP", 
+  minGSSize = 50,
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.05, 
+  qvalueCutoff = 0.05
+)
+
+```
+
+
+```{r dss_dotplots, fig.width=9}
+
+subset_seq <- c("extracellular matrix organization","regulation of cytokine production","nitric oxide biosynthetic process","reactive oxygen species biosynthetic process","tumor necrosis factor production","positive regulation of leukocyte chemotaxis","response to tumor necrosis factor","cellular response to interleukin-1","positive regulation of endocytosis","response to lipopolysaccharide","activation of MAPK activity","positive regulation of fibroblast proliferation","regulation of lymphocyte activation","leukocyte proliferation","acute inflammatory response")
+
+mods_dss_seq <- dropGO(mods_dss, term = mods_dss@compareClusterResult$ID[!mods_dss@compareClusterResult$Description %in% subset_seq])
+dotplot(mods_dss_seq, showCategory = 20)
+
+```
+
+# Current animal models and suggestions
+
+```{r models_lit}
+
+marker_list <- c("Myh11", "Twist2", "Col6a1", "Col1a2", "Foxl1", "S100a4", "Postn", "Mapkapk2", "Cspg4", "Fap")
+
+dp_data <- calc_dots(ds$sc_hc, marker_list)
+dp_data <- dp_data[dp_data$cex > 0.05,]
+
+p1 <- ggplot(data = dp_data) + 
+  geom_point(aes(x=x,y=y,fill=col,size=cex), pch = 21) + 
+  scale_fill_viridis(option = "inferno", "avg\nexp") + 
+  scale_size_continuous(limits = c(0.05,1), "prob\ndetect") +  
+  ylab("Cluster ID") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,hjust = 1, vjust = 0.5,size = 12), 
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        legend.position = "left")
+
+```
+
+```{r models_new, fig.width=10, fig.height=6}
+
+marker_list <- c("Pcolce2","Ackr4","Sox6","Fgf9","Hcar2","Nxf7","Sfrp2","Hapln1","Fgf10","Serpina3g","Hhip","Pde6h")
+
+dp_data <- calc_dots(ds$sc_hc, marker_list)
+dp_data <- dp_data[dp_data$cex > 0.05,]
+
+p2 <- ggplot(data = dp_data) + 
+  geom_point(aes(x=x,y=y,fill=col,size=cex), pch = 21) + 
+  scale_fill_viridis(option = "inferno", "avg\nexp", guide = "none") + 
+  scale_size_continuous(limits = c(0.05,1), "prob\ndetect", guide = "none") +  
+  ylab("Cluster ID") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,hjust = 1, vjust = 0.5,size = 12), 
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        legend.position = "left")
+
+plot_grid(p1,p2, align = "h", ncol = 2, rel_widths = c(5.2,4.8))
+
+```
+
+# Differential expression
+
+## Align annotation
+
+```{r align_anno}
+
+sc_hc <- ds$sc_hc
+sc_dss <- ds$sc_dss
+
+sc_hc@ident <- plyr::mapvalues(sc_hc@ident, from = c("Str1.1","Str1.2","Str1.3","Str3"), 
+                               to = c("Str1","Str1","Str1","Str3/4"), warn_missing = FALSE)
+
+sc_dss@ident <- plyr::mapvalues(sc_dss@ident, from = c("Str1.1","Str1.2","Str3.1","Str3.2","Str3.3","Str4"), 
+                               to = c("Str1","Str1","Str3/4","Str3/4","Str3/4","Str3/4"), warn_missing = FALSE)
+
+sc_hc <- StashIdent(sc_hc, save.name = "DE_clust")
+sc_dss <- StashIdent(sc_dss, save.name = "DE_clust")
+
+all_clust <- union(levels(sc_hc@ident),levels(sc_dss@ident))
+col_scale <- rainbow_hcl(length(all_clust))
+names(col_scale) <- all_clust
+
+p3 <- TSNEPlot(sc_hc, do.label = F, do.return = T) + ggtitle("Healthy") + scale_color_manual(values = col_scale) + theme(legend.position = "none")
+p4 <- TSNEPlot(sc_dss, do.label = F, do.return = T) + ggtitle("DSS") + scale_color_manual(values = col_scale) + theme(legend.position = "right")
+
+```
+
+```{r plot_de, fig.height=4.5}
+
+plot_grid(p3,p4,align="h",rel_widths = c(4.1,5.9))
+
+```
+
+## Merge Seurat objects
+
+```{r merge}
+
+sc <- MergeSeurat(sc_hc, sc_dss, min.cells = 3, min.genes = 200, 
+                  do.logNormalize = TRUE, total.expr = 1e4, 
+                  do.scale = FALSE, do.center = FALSE,
+                  add.cell.id1 = "H", add.cell.id2 = "D")
+
+sc@data.info$DE_ident <- paste(sc@data.info$DE_clust, substring(sc@data.info$batch,1,1), sep = ".")
+
+sc <- SetIdent(sc, ident.use = sc@data.info$DE_ident)
+
+```
+
+## Construct DE gene lists
+
+```{r de_lists}
+
+sc <- SetIdent(sc, ident.use = sc@data.info$DE_ident)
+cla <- ClusterAlpha(sc)
+cla <- cla[,grepl(".D", colnames(cla))]
+
+gene_cl <- unlist(apply(cla,1,function(x) colnames(cla)[which(x %in% max(x))[1]]))
+
+DElist <- list()
+for(cl in levels(as.factor(sc@data.info$DE_clust))) {
+  if(paste0(cl,".D") %in% sc@data.info$DE_ident) {
+    DElist[[cl]] <- FindMarkers(sc, paste0(cl,".D"), paste0(cl,".H"), test.use = "negbinom", only.pos = TRUE, latent.vars = c("nUMI","G2M","G1","batch"))
+  }
+}
+
+```
+
+```{r anno_DE}
+
+DElist <- sapply(names(DElist), function(x) {
+  out <- DElist[[x]]
+  out$cluster <- x
+  out$gene <- rownames(out)
+  out$top_clust <- apply(out,1,function(y) ifelse(gene_cl[y["gene"]]==paste0(x,".D"),TRUE,FALSE))
+  out
+  }, simplify = FALSE)
+
+DEdf <- do.call("rbind",DElist)
+
+```
+
+## Plot selected DE genes
+
+```{r diff_response}
+
+plotGeneViolins(c("Grem1","Il11","Mmp3"), c("Str1","Str2","Str3/4"), sc, plot_type = "beeswarm")
+plotGeneViolins(c("Lcn2","Cxcl13","Timp3"), c("Str1","Str2","Str3/4"), sc, plot_type = "beeswarm")
+plotGeneViolins(c("Il33","Il6","Ptx3"), c("Str1","Str2","Str3/4"), sc, plot_type = "beeswarm")
+
+```
+
+# Save data
+
+```{r save_out}
+
+saveXLS(hc_allmarkers,"output/healthy_markers.xlsx",min_n = 200)
+saveXLS(dss_allmarkers,"output/dss_markers.xlsx",min_n = 200)
+saveXLS(DEdf,"output/de_genes.xlsx", grp_var = "cluster", sort_var = "p_val", sort_desc = FALSE, sort_thr = 1, max_n = 300)
+saveRDS(sc@data.info, file = "output/merged_annotation.RData")
+
+```

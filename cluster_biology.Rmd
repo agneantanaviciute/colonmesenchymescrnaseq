@@ -1,0 +1,799 @@
+---
+title: '10X Biological interpretation - Mouse Dataset'
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'cluster_biology'
+  data1:
+    input: text
+    label: 'Seurat dataset 1 name'
+    value: '10X_Ms_Healthy'
+  data2:
+    input: text
+    label: 'Seurat dataset 2 name'
+    value: '10X_Ms_DSS'
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(colorspace)
+library(viridis)
+library(stats)
+library(cowplot)
+library(reshape2)
+library(WGCNA)
+library(gplots)
+library(scater)
+
+source("seurat_functions.R")
+
+```
+
+# Healthy dataset
+
+## Data import and setup
+
+```{r load_healthy}
+
+# Load the preprocessed seurat object
+sc_hc <- readRDS(paste0("output/clust_analysis/", params$data1, "/sc_reclustered.RData"))
+clan_hc <- readRDS(paste0("output/clust_analysis/", params$data1, ".RData"))
+
+```
+
+## Identify and merge low confidence nodes
+
+```{r node_confidence, fig.width=6, fig.height=4}
+
+PlotClusterTree(sc_hc)
+
+ns_df <- clan_hc$node.scores
+ns_df$node <- factor(ns_df$node, levels = ns_df$node)
+ggplot(data=ns_df, aes(x=node, y=oobe)) + geom_col() + geom_hline(yintercept = 0.05, linetype = "dashed")
+
+```
+
+```{r TSNE_split, fig.width=6, fig.height=4}
+
+ColorTSNESplit(sc_hc, node = 28)
+ColorTSNESplit(sc_hc, node = 24)
+
+```
+
+```{r merge_low_conf_hc}
+
+sc_hc <- MergeNode(sc_hc, node.use = 24)
+sc_hc <- BuildClusterTree(sc_hc, do.reorder = T, reorder.numeric = T, do.plot = F)
+PlotClusterTree(sc_hc)
+TSNEPlot(sc_hc, do.label = T, pt.size = 0.6)
+
+```
+
+## Identify clusters based on known marker expression
+
+```{r marker_dotplot, fig.width=10, fig.height=8}
+
+marker_list <- c("Epcam","Krt19","Kit","Ano1","Myh11","Des",
+                 "Rgs5","Pdgfrb","Pecam1","Lyve1",
+                 "S100b","Gfap","Cd52","Ptprc",
+                 "Acta2","Dpt","Col6a2","Col1a2")
+
+marker_spec <- c("Epithelial","Epithelial","ICC","ICC","Smooth muscle",
+                 "Smooth muscle","Pericyte","Pericyte","Endothelial","Lymphatic",
+                 "Glial","Glial","Immune","Immune","Fibroblast",
+                 "Fibroblast","Fibroblast","Fibroblast")
+
+cluster_labels <- c("Epithelial","Smooth muscle / ICC","Pericyte",
+                    "Myofibroblast","SMA+ fibroblast", 
+                    "Endothelium","Lymphatic","Glial","Immune",
+                    "\n\n\nFibroblast subtypes\n\n\n")
+
+dp_data <- calc_dots(sc_hc, marker_list)
+dp_data <- dp_data[dp_data$cex > 0.05,]
+
+p1 <- ggplot(data = dp_data) + 
+  geom_point(aes(x=x,y=y,fill=col,size=cex), pch = 21) + 
+  scale_fill_viridis(option = "inferno", "avg\nexp") + 
+  scale_size_continuous(limits = c(0.05,1), "prob\ndetect") +  
+  ylab("Cluster ID") +
+  annotate("label", x = rep(23,10), y = c(1:9,11.5), label = cluster_labels, hjust = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,hjust = 1, vjust = 0.5,size = 12), 
+        axis.text.y = element_text(size=12),
+        axis.title.x = element_blank(),
+        legend.position = "left")
+
+marker_spec <- factor(marker_spec, levels = unique(marker_spec))
+
+p2 <- ggplot(data=data.frame(x=(1:18)-0.5, ms = marker_spec)) + geom_tile(aes(x=x,y=1,fill=ms)) + 
+  scale_fill_discrete("Marker\nspecificity") +
+  coord_cartesian(xlim = c(1,21.5)) +
+  theme_nothing() + theme(legend.position = "left", plot.margin = unit(c(0,0,2,0),"cm"))
+
+p3 <- plot_grid(p1,p2, ncol = 1, align = "v", rel_heights = c(7,3))
+
+p3
+
+```
+
+### Illustrate cluster 3 split
+
+```{r clust_3_tsne}
+# Remove one very distant cell to focus on area of interest on TSNE
+cl2 <- colnames(sc_hc@data)[sc_hc@ident==2]
+cl2 <- cl2[cl2!="AGGGATGCATTTCACT-1"]
+
+FeaturePlot(sc_hc, c("Actg2","Des","Kit","Ano1"), 
+            cells.use = cl2, pt.size = 1, cols.use = c("lightgrey","blue"), 
+            no.legend = FALSE)
+
+```
+
+## Identify fibroblast subtypes seen in human data
+
+### Subset to fibroblast-like cells only and detect markers
+
+```{r subset_flc_hc}
+
+sc.flc <- SubsetData(sc_hc, cells.use = colnames(sc_hc@data)[sc_hc@ident %in% c(4,5,10:13)])
+TSNEPlot(sc.flc, do.label = T)
+
+flc.markers0 <- FindAllMarkers(sc.flc, only.pos = TRUE, min.pct = 0.25, 
+                              thresh.use = 0.25, test.use = "roc", return.thresh = 0.3)
+
+```
+
+### Load human dataset and annotate with mouse gene symbols
+
+```{r human_data}
+
+P150409 <- readRDS("data/P150409/hisat2_fc_GRCh38_rel84.analysis.RData")
+
+sc_Hs <- P150409$scData
+
+sc_Hs_mgi <- convertHumanGeneList(featureNames(sc_Hs))
+
+# Where 1-to-many relationship exists between human and mouse IDs
+# select mouse gene symbol with highest mean expression
+totUMIcounts <- rowSums(as.matrix(sc_hc@data))
+sc_Hs_mgi$totUMIs <- sapply(sc_Hs_mgi$MGI.symbol, function(x) totUMIcounts[x])
+sc_Hs_mgi <- sc_Hs_mgi[!is.na(sc_Hs_mgi$totUMIs),]
+sc_Hs_mgi %>% group_by(Gene.stable.ID) %>% top_n(1,totUMIs) -> sc_Hs_mgi_top
+sc_Hs_mgi_top <- sc_Hs_mgi_top[!duplicated(sc_Hs_mgi_top$Gene.stable.ID),]
+
+# Append to human SCESet
+fData(sc_Hs)$mgi_symbol <- NA
+fData(sc_Hs)[sc_Hs_mgi_top$Gene.stable.ID,"mgi_symbol"] <- sc_Hs_mgi_top$MGI.symbol
+
+```
+
+### Cross-tabulate cluster markers for fibroblast like cells in both datasets
+
+```{r prep_markers}
+
+
+flc.markers <- flc.markers0[flc.markers0$myAUC > 0.67,]
+
+## Ensure mouse markers are unique and present in the human dataset
+flc.markers <- flc.markers[order(flc.markers$myAUC, decreasing = TRUE),]
+flc.markers <- flc.markers[!duplicated(flc.markers$gene),]
+flc.markers <- flc.markers[flc.markers$gene %in% fData(sc_Hs)$mgi_symbol,]
+
+## Human cluster markers
+hs.markers <- P150409$ROCmark
+hs.markers$mgi_symbol <- fData(sc_Hs)[rownames(hs.markers),"mgi_symbol"]
+hs.markers <- hs.markers[!is.na(hs.markers$mgi_symbol),]
+hs.markers <- hs.markers[hs.markers$AUC > 0.65,]
+hs.markers <- hs.markers[order(hs.markers$AUC, decreasing = TRUE),]
+hs.markers <- hs.markers[!duplicated(hs.markers$mgi_symbol),]
+
+## Data frame for all shared genes showing cluster annotation in both datasets
+Ms_Hs <- data.frame(mgi_symbol = sc_Hs_mgi_top$MGI.symbol, 
+                    hs_clust = rep("grey",length(sc_Hs_mgi_top$MGI.symbol)),
+                    ms_clust = rep(0, length(sc_Hs_mgi_top$MGI.symbol)))
+
+for(i in flc.markers$gene) {
+  Ms_Hs$ms_clust[Ms_Hs$mgi_symbol==i] <- as.character(flc.markers$cluster[flc.markers$gene == i])
+}
+
+for(i in hs.markers$mgi_symbol) {
+  Ms_Hs$hs_clust[Ms_Hs$mgi_symbol==i] <- hs.markers$Group[hs.markers$mgi_symbol == i]
+}
+
+Ms_Hs %>% group_by(hs_clust) %>% summarise(n_mark = length(hs_clust)) -> nmark_hs
+Ms_Hs %>% group_by(ms_clust) %>% summarise(n_mark = length(ms_clust)) -> nmark_ms
+
+```
+
+```{r marker_crosstab_hc}
+
+# Crosstabulate marker annotation
+d_cast <- dcast(Ms_Hs, hs_clust ~ ms_clust, value.var = "ms_clust", fun.aggregate = length)
+d_cross <- as.matrix(d_cast[,-1])
+row.names(d_cross) <- d_cast$hs_clust
+d_cross <- d_cross[c(2,1,3,4,5),order(as.numeric(colnames(d_cross)))]
+
+fisher <- function(i,j) {
+  fisher.test(matrix(c(
+    d_cross[i,j],
+    sum(d_cross[i,]) - d_cross[i,j],
+    sum(d_cross[,j]) - d_cross[i,j], 
+    sum(d_cross[row.names(d_cross) != i, colnames(d_cross) != j])
+    ), nrow = 2, byrow = TRUE))$p.value
+}
+
+d_pval <- sapply(colnames(d_cross), function(j) sapply(row.names(d_cross), function(i) fisher(i,j)))
+
+# Remove unassigned groups from result
+d_cross <- d_cross[row.names(d_cross)!="grey", colnames(d_cross)!=0]
+d_pval <- d_pval[row.names(d_pval)!="grey", colnames(d_pval)!=0]
+
+# Will display correlations and their p-values
+textMatrix = paste(unlist(d_cross), "\n(",
+                   signif(unlist(d_pval), 1), ")", sep = "")
+
+dim(textMatrix) = dim(d_cross)
+
+Hs_names <- list(brown = "MF",blue = "Str2", turquoise = "Str3", yellow = "Str1")
+
+par(mar = c(8, 8, 4, 3), mgp = c(5,1,0));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = -log(d_pval),
+               xLabels = sapply(colnames(d_cross), function(x) paste0("Cls ",x," (",nmark_ms$n_mark[nmark_ms$ms_clust==x],")")),
+               yLabels = paste0("XX",row.names(d_cross)),
+               ySymbols = sapply(row.names(d_cross), function(x) paste0(Hs_names[[x]]," (",nmark_hs$n_mark[nmark_hs$hs_clust==x],")")),
+               xSymbols = colnames(d_cross),
+               xLabelsPosition = "bottom",
+               xLabelsAngle = 45,
+               xLabelsAdj = 1,
+               colors = blueWhiteRed(50)[25:50],
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 1,
+               cex.lab = 1,
+               zlim = c(0,50),
+               plotLegend = TRUE,
+               xlab = "Mouse",
+               ylab = "Human",
+               main = paste0("Marker gene cross-tabulation\n", nrow(Ms_Hs), " shared genes"))
+
+```
+
+### Subset marker genes common to mouse and human
+
+```{r common_markers, fig.width=8, fig.height=4}
+
+Ms_Hs$both <- paste0(Ms_Hs$hs_clust,Ms_Hs$ms_clust)
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="brown4","mgi_symbol"],]
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="blue5","mgi_symbol"],]
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="turquoise10","mgi_symbol"],]
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="turquoise11","mgi_symbol"],]
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="yellow12","mgi_symbol"],]
+flc.markers[flc.markers$gene %in% Ms_Hs[Ms_Hs$both=="yellow13","mgi_symbol"],]
+
+FeaturePlot(sc_hc,c("Aoc3","Acta2"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Sox6","Wnt5a"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Maff","Cd55"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Ier3","Ptgs2"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Cxcl12","Adamdec1"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Edil3","Hapln1"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+
+
+FeaturePlot(sc_hc,c("Zeb1","Zeb2"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Bmp2","Frzb"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+FeaturePlot(sc_hc,c("Thy1","F3"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+
+```
+
+## Annotated clustering hierarchy
+
+```{r anno_healthy_tsne}
+
+sc_hc <- StashIdent(sc_hc, save.name = "merged_ids")
+
+current.cluster.ids <- 1:13
+new.cluster.ids <- c("Epithelial",
+                     "Sm mus/ICC",
+                     "Pericyte",
+                     "Myofibroblast",
+                     "Str2",
+                     "Endothelial",
+                     "Lymphatic",
+                     "Glial",
+                     "Immune",
+                     "Str3",
+                     "Str1.3",
+                     "Str1.1",
+                     "Str1.2")
+
+sc_hc@ident <- plyr::mapvalues(sc_hc@ident, from = current.cluster.ids, to = new.cluster.ids)
+flc.markers0$cluster <- plyr::mapvalues(flc.markers0$cluster, from = current.cluster.ids, to = new.cluster.ids)
+
+TSNEPlot(sc_hc, do.label = T, pt.size = 0.6, do.return = TRUE) + xlim(c(-40,50))
+
+sc_hc <- StashIdent(sc_hc, save.name = "clust_names")
+
+```
+
+```{r labelled_tree, fig.height=5}
+
+sc_hc <- BuildClusterTree(sc_hc, do.reorder = F, reorder.numeric = F, do.plot = F)
+PlotClusterTree(sc_hc)
+
+```
+
+# DSS colitis dataset
+
+## Data import and setup
+
+```{r load_dss}
+
+# Load the preprocessed seurat object
+sc_dss <- readRDS(paste0("output/clust_analysis/", params$data2, "/sc_reclustered.RData"))
+clan_dss <- readRDS(paste0("output/clust_analysis/", params$data2, ".RData"))
+
+```
+
+## Identify and merge low confidence nodes
+
+```{r node_confidence_dss, fig.width=6, fig.height=4}
+
+PlotClusterTree(sc_dss)
+
+ns_df <- clan_dss$node.scores
+ns_df$node <- factor(ns_df$node, levels = ns_df$node)
+ggplot(data=ns_df, aes(x=node, y=oobe)) + geom_col() + geom_hline(yintercept = 0.05, linetype = "dashed")
+
+```
+
+```{r TSNE_split_dss, fig.width=6, fig.height=4}
+
+
+ColorTSNESplit(sc_dss, node = 17)
+ColorTSNESplit(sc_dss, node = 23)
+
+```
+
+```{r merge_low_conf_dss}
+
+sc_dss <- MergeNode(sc_dss, node.use = 23)
+sc_dss <- BuildClusterTree(sc_dss, do.reorder = T, reorder.numeric = T, do.plot = F)
+TSNEPlot(sc_dss, do.label = T, pt.size = 0.6)
+
+```
+
+## Use healthy cluster definitions to classify cells in DSS
+
+```{r forest_classify, fig.width=8, fig.height=4.5}
+
+hc.rf <- BuildRFClassifier(sc_hc, training.genes = sc_hc@var.genes, training.classes = sc_hc@data.info$merged_ids)
+
+dss_hc_id <- ClassifyCells(sc_hc, hc.rf, new.data = sc_dss@data)
+sc_dss <- StashIdent(sc_dss, save.name = "merged_ids")
+sc_dss <- SetIdent(sc_dss, ident.use = dss_hc_id)
+sc_dss <- StashIdent(sc_dss, save.name = "dss_hc_id")
+sc_dss@ident <- plyr::mapvalues(sc_dss@ident, from = current.cluster.ids, to = new.cluster.ids)
+
+p5 <- TSNEPlot(sc_hc, do.label = F, do.return = T, pt.size = 0.4, no.legend = TRUE) + ggtitle("Healthy") + theme(axis.title = element_blank())
+p6 <- TSNEPlot(sc_dss, do.label = F, do.return = T, pt.size = 0.4, no.legend = FALSE) + ggtitle("DSS") + theme(axis.title = element_blank())
+plot_grid(p5,p6,align = "h", ncol = 2, rel_widths = c(4.15,5.85))
+
+```
+
+### Changes in relative abundance of stromal subtypes
+
+```{r dss_abudance}
+cell_df <- data.frame(prop.table(table(sc_hc@data.info$merged_ids)), prop.table(table(dss_hc_id)))
+cell_df <- cell_df[,c(1,2,4)]
+colnames(cell_df) <- c("cell_type","healthy","dss")
+cell_df <- cell_df[order(as.numeric(as.character(cell_df$cell_type))),]
+cell_df$cell_type <- plyr::mapvalues(cell_df$cell_type, from = current.cluster.ids, to = new.cluster.ids)
+cell_df$fill <- rainbow_hcl(13)
+ordered_cts <- cell_df$cell_type[order(cell_df$healthy)]
+cell_df$cell_type <- factor(cell_df$cell_type, levels = ordered_cts)
+cell_df <- reshape2::melt(cell_df, variable.name = "state", value.name = "proportion")
+
+ggplot(data = cell_df, aes(x = cell_type, label = cell_type, fill = fill, y = proportion))+
+  geom_bar(stat = "identity", colour = "black", alpha = 1) + 
+  geom_text(aes(label=sprintf("%1.0f%%", 100*proportion)),hjust=-0.2, size = 6) +
+  facet_grid(. ~ state) + 
+  scale_fill_identity() +
+  expand_limits(y = c(0,max(0.5,max(cell_df$proportion) + 0.1))) +
+  coord_flip() +
+  theme_classic() + 
+  theme(
+    strip.text.x = element_text(size = 16),
+    strip.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA),
+    axis.ticks.x=element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.line.x=element_blank(), 
+    axis.line.y=element_blank(),
+    axis.title.x=element_blank(), 
+    axis.title.y=element_blank(),
+    axis.text.x=element_blank(),
+    axis.text.y=element_text(size = 16)
+  )
+
+```
+
+
+```{r abundance_byrep}
+
+pr_list <- c(
+  lapply(levels(sc_hc@data.info$batch),
+         function(x) prop.table(table(sc_hc@data.info$merged_ids[sc_hc@data.info$batch == x]))),
+  lapply(levels(sc_dss@data.info$batch),
+         function(x) prop.table(table(dss_hc_id[sc_dss@data.info$batch == x])))
+  )
+
+pr_mat <- sapply(1:length(pr_list), function(j) {
+  sapply(levels(as.factor(sc_hc@data.info$merged_ids)), function(i) {
+    pr_list[[j]][i]
+  })
+})
+
+rownames(pr_mat) <- levels(as.factor(sc_hc@data.info$merged_ids))
+colnames(pr_mat) <- c(levels(sc_hc@data.info$batch),levels(sc_dss@data.info$batch))
+pr_mat[is.na(pr_mat)] <- 0
+
+cell_df <- data.frame(pr_mat)
+cell_df$cell_type <- plyr::mapvalues(rownames(cell_df), from = current.cluster.ids, to = new.cluster.ids)
+cell_df <- cell_df[order(as.numeric(rownames(cell_df))),]
+cell_df$fill <- rainbow_hcl(13)
+ordered_cts <- cell_df$cell_type[order(cell_df$HC1)]
+cell_df$cell_type <- factor(cell_df$cell_type, levels = ordered_cts)
+
+cell_tt <- apply(pr_mat,1,function(x) t.test(x[1:3],x[4:6],alternative = "two.sided",paired = FALSE)$p.value)
+print(paste(plyr::mapvalues(names(cell_tt), 
+                            from = current.cluster.ids, 
+                            to = new.cluster.ids),signif(cell_tt,2)))
+
+cell_df <- reshape2::melt(cell_df, variable.name = "state", value.name = "proportion")
+cell_df$state <- factor(substring(as.character(cell_df$state),1,2), levels=c("HC","DS"))
+levels(cell_df$state) <- c("HC","DSS")
+
+ggplot(data = cell_df[as.numeric(cell_df$cell_type) <= 7,],
+       aes(x = state, label = cell_type, fill = fill, y = proportion)) +
+  geom_bar(stat = "summary", fun.y = "mean", colour = "black", alpha = 1) + 
+  geom_point() +
+  stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), 
+        geom="errorbar", width=0.5) +
+  facet_grid(. ~ cell_type) + 
+  scale_fill_identity() +
+  theme_classic() + 
+  theme(
+    strip.text.x = element_text(size = 12, angle = 0),
+    strip.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA),
+    axis.ticks.x=element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.line.x=element_blank(), 
+    axis.line.y=element_blank(),
+    axis.title.x=element_blank(), 
+    axis.title.y=element_blank(),
+    axis.text.x=element_text(size = 12),
+    axis.text.y=element_text(size = 12)
+  )
+
+ggplot(data = cell_df[as.numeric(cell_df$cell_type) > 7,], 
+       aes(x = state, label = cell_type, fill = fill, y = proportion)) +
+  geom_bar(stat = "summary", fun.y = "mean", colour = "black", alpha = 1) + 
+  geom_point() +
+  stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), 
+        geom="errorbar", width=0.5) +
+  facet_grid(. ~ cell_type) + 
+  scale_fill_identity() +
+  theme_classic() + 
+  theme(
+    strip.text.x = element_text(size = 12, angle = 0),
+    strip.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA),
+    axis.ticks.x=element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.line.x=element_blank(), 
+    axis.line.y=element_blank(),
+    axis.title.x=element_blank(), 
+    axis.title.y=element_blank(),
+    axis.text.x=element_text(size = 12),
+    axis.text.y=element_text(size = 12)
+  )
+
+```
+
+## Human UC stromal 4 cluster vs Murine DSS dataset
+
+### Subset to fibroblast-like cells and detect markers
+
+```{r subset_flc_dss}
+# Switch back to numeric identifiers
+sc_dss <- SetIdent(sc_dss, ident.use = sc_dss@data.info$merged_ids)
+
+dss.flc <- SubsetData(sc_dss, cells.use = colnames(sc_dss@data)[sc_dss@data.info$merged_ids %in% 4:11])
+TSNEPlot(dss.flc, do.label = T)
+
+dss.markers0 <- FindAllMarkers(dss.flc, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25, test.use = "roc", return.thresh = 0.3)
+
+```
+
+```{r human_uc_data}
+
+P160099 <- readRDS("data/P160099/hisat2_fc_GRCh38_rel84.analysis.RData")
+
+sc_UC <- P160099$scData
+sc_UC_mgi <- convertHumanGeneList(featureNames(sc_UC))
+
+# Where 1-to-many relationship exists between human and mouse IDs
+# select mouse gene symbol with highest mean expression
+totUMIcounts <- rowSums(as.matrix(sc_dss@data))
+sc_UC_mgi$totUMIs <- sapply(sc_UC_mgi$MGI.symbol, function(x) totUMIcounts[x])
+sc_UC_mgi <- sc_UC_mgi[!is.na(sc_UC_mgi$totUMIs),]
+sc_UC_mgi %>% group_by(Gene.stable.ID) %>% top_n(1,totUMIs) -> sc_UC_mgi_top
+sc_UC_mgi_top <- sc_UC_mgi_top[!duplicated(sc_UC_mgi_top$Gene.stable.ID),]
+
+# Append to human SCESet
+fData(sc_UC)$mgi_symbol <- NA
+fData(sc_UC)[sc_UC_mgi_top$Gene.stable.ID,"mgi_symbol"] <- sc_UC_mgi_top$MGI.symbol
+
+```
+
+### Cross-tabulate cluster markers
+
+```{r prep_markers_DSS}
+
+dss.markers <- dss.markers0[dss.markers0$myAUC > 0.67,]
+
+## Ensure mouse markers are unique and present in the human dataset
+dss.markers <- dss.markers[order(dss.markers$myAUC, decreasing = TRUE),]
+dss.markers <- dss.markers[!duplicated(dss.markers$gene),]
+dss.markers <- dss.markers[dss.markers$gene %in% fData(sc_UC)$mgi_symbol,]
+
+## Human cluster markers
+uc.markers <- P160099$ROCmark
+uc.markers$mgi_symbol <- fData(sc_UC)[rownames(uc.markers),"mgi_symbol"]
+uc.markers <- uc.markers[!is.na(uc.markers$mgi_symbol),]
+uc.markers <- uc.markers[uc.markers$AUC > 0.65,]
+uc.markers <- uc.markers[order(uc.markers$AUC, decreasing = TRUE),]
+uc.markers <- uc.markers[!duplicated(uc.markers$mgi_symbol),]
+
+## Data frame for all shared genes showing cluster annotation in both datasets
+dss_uc <- data.frame(mgi_symbol = sc_UC_mgi_top$MGI.symbol, 
+                    hs_clust = rep("grey",length(sc_UC_mgi_top$MGI.symbol)),
+                    ms_clust = rep(0, length(sc_UC_mgi_top$MGI.symbol)))
+
+for(i in dss.markers$gene) {
+  dss_uc$ms_clust[dss_uc$mgi_symbol==i] <- as.character(dss.markers$cluster[dss.markers$gene == i])
+}
+
+for(i in uc.markers$mgi_symbol) {
+  dss_uc$hs_clust[dss_uc$mgi_symbol==i] <- uc.markers$Group[uc.markers$mgi_symbol == i]
+}
+
+dss_uc %>% group_by(hs_clust) %>% summarise(n_mark = length(hs_clust)) -> nmark_uc
+dss_uc %>% group_by(ms_clust) %>% summarise(n_mark = length(ms_clust)) -> nmark_dss
+
+```
+
+```{r marker_crosstab_dss, fig.height=3}
+
+# Crosstabulate marker annotation
+d_cast <- dcast(dss_uc, hs_clust ~ ms_clust, value.var = "ms_clust", fun.aggregate = length)
+d_cross <- as.matrix(d_cast[,-1])
+row.names(d_cross) <- d_cast$hs_clust
+d_cross <- d_cross[c(3,2,6,1,5,4),order(as.numeric(colnames(d_cross)))]
+
+fisher <- function(i,j) {
+  fisher.test(matrix(c(
+    d_cross[i,j],
+    sum(d_cross[i,]) - d_cross[i,j],
+    sum(d_cross[,j]) - d_cross[i,j], 
+    sum(d_cross[row.names(d_cross) != i, colnames(d_cross) != j])
+    ), nrow = 2, byrow = TRUE))$p.value
+}
+
+d_pval <- sapply(colnames(d_cross), function(j) sapply(row.names(d_cross), function(i) fisher(i,j)))
+
+# Remove grey module from result
+d_cross <- d_cross[row.names(d_cross)!="grey", colnames(d_cross)!=0]
+d_pval <- d_pval[row.names(d_pval)!="grey", colnames(d_pval)!=0]
+
+# Will display correlations and their p-values
+textMatrix = paste(unlist(d_cross), "\n(",
+                   signif(unlist(d_pval), 1), ")", sep = "")
+
+dim(textMatrix) = dim(d_cross)
+
+UC_names <- list(brown = "MF",blue = "Str2", turquoise = "Str3", yellow = "Str1", green = "Str4")
+
+par(mar = c(6, 12, 4, 3), mgp = c(3,1,0));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = -log(d_pval[1,,drop=FALSE]),
+               xLabels = sapply(colnames(d_cross), function(x) paste0("Cls ",x,"\n(",nmark_dss$n_mark[nmark_dss$ms_clust==x],")")),
+               yLabels = paste0("XX",row.names(d_cross))[1],
+               ySymbols = sapply(row.names(d_cross), function(x) paste0(UC_names[[x]]," (",nmark_uc$n_mark[nmark_uc$hs_clust==x],")"))[1],
+               xSymbols = colnames(d_cross),
+               xLabelsPosition = "bottom",
+               xLabelsAngle = 0,
+               xLabelsAdj = c(0.5,1),
+               colors = blueWhiteRed(50)[25:50],
+               textMatrix = textMatrix[1,,drop=FALSE],
+               setStdMargins = FALSE,
+               cex.text = 1,
+               cex.lab = 1,
+               zlim = c(0,20),
+               plotLegend = TRUE,
+               xlab = "Mouse",
+               ylab = "Human",
+               main = paste0("Marker gene cross-tabulation\n", nrow(dss_uc), " shared genes"))
+
+```
+
+```{r cl7_split, fig.height=4, fig.width=4}
+
+sc_dss@data.info$Str4 <- sc_dss@data.info$merged_ids == 7
+TSNEPlot(sc_dss, group.by = "Str4",colors.use = c("lightgrey","red"), no.legend = TRUE, do.return = TRUE) + 
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+```
+
+```{r s4_subset, fig.width=8, fig.height=4}
+
+dss_uc$both <- paste0(dss_uc$hs_clust,dss_uc$ms_clust)
+dss.markers[dss.markers$gene %in% dss_uc[dss_uc$both=="green7","mgi_symbol"],]
+
+FeaturePlot(dss.flc,c("Il33","Ccl19"), cols.use = c("lightgrey","blue"), pt.size = 0.6)
+
+```
+
+```{r clust_heat}
+
+pr_tab <- sapply(levels(as.factor(sc_dss@data.info$merged_ids)), function(x) prop.table(table(dss_hc_id[sc_dss@data.info$merged_ids==x])))
+class(pr_tab)
+rownames(pr_tab) <- plyr::mapvalues(rownames(pr_tab), from = current.cluster.ids, to = new.cluster.ids)
+pr_tab <- pr_tab[as.hclust(sc_hc@cluster.tree[[1]])$labels,as.hclust(sc_dss@cluster.tree[[1]])$labels]
+heatmap.2(pr_tab, Colv = as.dendrogram(as.hclust(sc_dss@cluster.tree[[1]])), 
+          Rowv = as.dendrogram(as.hclust(sc_hc@cluster.tree[[1]])), 
+          trace = "none", col = viridis(75),xlab = "DSS cluster", ylab = "Healthy cluster", 
+          density.info = "none", key.title = NA, margins = c(4,8))
+
+```
+
+```{r dss_labelled}
+
+sc_dss <- SetIdent(sc_dss, ident.use = sc_dss@data.info$merged_ids)
+current.cluster.ids <- 1:11
+new.cluster.ids <- c("Lymphatic",
+                     "Endothelial",
+                     "Pericyte",
+                     "Str3.1",
+                     "Str3.2",
+                     "Str3.3",
+                     "Str4",
+                     "Myofibroblast",
+                     "Str1.1",
+                     "Str2",
+                     "Str1.2")
+
+sc_dss@ident <- plyr::mapvalues(sc_dss@ident, from = current.cluster.ids, to = new.cluster.ids)
+dss.markers0$cluster <- plyr::mapvalues(dss.markers0$cluster, from = current.cluster.ids, to = new.cluster.ids)
+
+TSNEPlot(sc_dss, do.label = T, pt.size = 0.6, do.return = TRUE)
+
+sc_dss <- StashIdent(sc_dss, save.name = "clust_names")
+
+```
+
+```{r labelled_tree_dss, fig.height=5}
+
+sc_dss <- BuildClusterTree(sc_dss, do.reorder = F, reorder.numeric = F, do.plot = F)
+PlotClusterTree(sc_dss)
+
+```
+
+## Cell cycle stage comparison
+
+```{r cell_cycle_clust}
+
+sc_dss@ident <- plyr::mapvalues(sc_dss@ident, from = c("Str3.1","Str3.2","Str3.3","Str1.1","Str1.2","Str1.3"), 
+                                to = c(rep("Str3",3),rep("Str1",3)), warn_missing = FALSE)
+sc_hc@ident <- plyr::mapvalues(sc_hc@ident, from = c("Str1.1","Str1.2","Str1.3"), to = rep("Str1",3), warn_missing = FALSE)
+
+sc_dss <- StashIdent(sc_dss, save.name = "no_subclust")
+sc_hc <- StashIdent(sc_hc, save.name = "no_subclust")
+
+cc_df <- data.frame(cluster = sc_dss@ident, G2M = sc_dss@data.info$G2M > 0.5 & sc_dss@data.info$G2M > sc_dss@data.info$G1)
+cc_df %>% group_by(cluster) %>% summarise(prop = sum(G2M)/length(G2M)) -> cc_dss
+
+cc_df <- data.frame(cluster = sc_hc@ident, G2M = sc_hc@data.info$G2M > 0.5 & sc_hc@data.info$G2M > sc_hc@data.info$G1)
+cc_df %>% group_by(cluster) %>% summarise(prop = sum(G2M)/length(G2M)) -> cc_hc
+
+cc_dss <- as.data.frame(cc_dss)
+cc_hc <- as.data.frame(cc_hc)
+cc_all <- data.frame(cluster = c("Endothelial", "Lymphatic","Pericyte","Epithelial",
+                                 "Sm mus/ICC","Glial","Immune","Myofibroblast",
+                                 "Str1","Str2","Str3","Str4"), Healthy = NA, DSS = NA)
+
+cc_all$Healthy <- sapply(cc_all$cluster, function(x) ifelse(x %in% cc_hc$cluster, 100*cc_hc$prop[cc_hc$cluster==x], NA))
+cc_all$DSS <- sapply(cc_all$cluster, function(x) ifelse(x %in% cc_dss$cluster, 100*cc_dss$prop[cc_dss$cluster==x], NA))
+cc_all$cluster <- factor(cc_all$cluster, levels = cc_all$cluster)
+cc_all <- melt(cc_all,variable.name = "condition",value.name = "pct_G2M")
+cc_all$isNA <- ifelse(is.na(cc_all$pct_G2M),"nd","")
+cc_all$pct_G2M[is.na(cc_all$pct_G2M)] <- 0
+
+ggplot(data=cc_all, aes(x=cluster, y=pct_G2M, fill=cluster)) + geom_col() + geom_text(aes(label = isNA, y=0), col = "darkgrey", vjust = 0) + 
+  facet_grid(condition ~ ., scales = "free_x") + 
+  scale_fill_discrete(guide = "none") +
+  ylab("% cells G2/M phase") +
+  ggtitle("Proliferative activity by cluster") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 16),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        strip.text.y = element_text(size = 16))
+```
+
+```{r cell_cycle_cond}
+
+ggplot(data=sc_hc@data.info[,c("G1","G2M","phases")], aes(x=G1,y=G2M,fill=phases)) + 
+  geom_point(pch = 21, size = 4, alpha = 0.7) +
+  xlim(c(0,1)) +
+  ylim(c(0,1)) +
+  geom_segment(aes(x = 0.5, y = 0, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0, y = 0.5, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 1, yend = 1)) +
+  annotate("text", x = 0.4, y = 0.4, label = "S") +
+  annotate("text", x = 0.5, y = 0.6, label = "G2/M") +
+  annotate("text", x = 0.6, y = 0.5, label = "G0/G1") +
+  ggtitle("Healthy controls")
+
+ggplot(data=sc_dss@data.info[,c("G1","G2M","phases")], aes(x=G1,y=G2M,fill=phases)) + 
+  geom_point(pch = 21, size = 4, alpha = 0.7) +
+  xlim(c(0,1)) +
+  ylim(c(0,1)) +
+  geom_segment(aes(x = 0.5, y = 0, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0, y = 0.5, xend = 0.5, yend = 0.5)) +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 1, yend = 1)) +
+  annotate("text", x = 0.4, y = 0.4, label = "S") +
+  annotate("text", x = 0.5, y = 0.6, label = "G2/M") +
+  annotate("text", x = 0.6, y = 0.5, label = "G0/G1") +
+  ggtitle("DSS challenge")
+
+```
+
+## Save out objects
+
+```{r save_objects}
+
+save_list <- list()
+objects_to_save <- c("dss.markers0","flc.markers0","sc_dss","sc_hc")
+
+for(x in objects_to_save) {
+    save_list[[x]] <- get(x)
+}
+
+saveRDS(save_list, file = paste0("output/",params$script_name,".RData"))
+
+```
+

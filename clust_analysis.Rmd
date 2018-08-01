@@ -1,0 +1,128 @@
+---
+title: '10X cluster classification and marker gene detection'
+author: "James Kinchen, University of Oxford"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+        dev: [png,pdf]
+params:
+  script_name:
+    input: text
+    label: 'Script identifier'
+    value: 'clust_analysis'
+  proj_name:
+    input: text
+    label: 'Seurat dataset name'
+    value: '10X_Ms_DSS'
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 6, message = FALSE, warning = FALSE, cache = TRUE, 
+                      cache.path = paste0("cache/",params$script_name,"/",params$proj_name,"/"),
+                      fig.path = paste0("output/",params$script_name,"/",params$proj_name,"/"))
+
+```
+
+```{r setup_2, include=FALSE, cache=FALSE}
+
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(colorspace)
+library(viridis)
+library(stats)
+
+```
+
+# Dataset - `r params$proj_name`
+
+## Data import and setup
+
+### Load dataset
+
+```{r import_raw}
+
+# Load the preprocessed seurat object
+sc <- readRDS(paste0("output/norm_clust/", params$proj_name, "/sc_clustered.RData"))
+
+```
+
+## Determine cluster hierarchy
+
+```{r cluster_hierarchy}
+
+sc <- BuildClusterTree(sc, do.reorder = T, reorder.numeric = T, do.plot = FALSE)
+
+```
+
+```{r plot_hierarchy, fig.height=4}
+
+PlotClusterTree(sc, edge.width = 2)
+
+```
+
+```{r clust_tsne_renumbered}
+
+TSNEPlot(sc, do.label = T, pt.size = 0.5, do.return = TRUE)
+
+```
+
+## Cluster confidence
+
+```{r node_scores}
+
+node.scores <- AssessNodes(sc)
+node.scores[order(node.scores$oobe,decreasing = T),] -> node.scores
+
+print(round(node.scores, 2))
+
+```
+
+## Node marker genes
+
+```{r node_markers}
+
+sc.nodemarkers <- FindAllMarkersNode(sc, test.use = "roc", only.pos = FALSE)
+node_markrs <- sc.nodemarkers %>% group_by(cluster) %>% top_n(10, power)
+
+```
+
+## Cluster marker genes
+
+```{r clust_markers}
+
+sc.markers <- FindAllMarkers(sc, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25, test.use = "roc")
+markrs <- sc.markers %>% group_by(cluster) %>% top_n(10, power)
+
+```
+
+```{r clust_heatmap}
+
+DoHeatmap(sc, genes.use = markrs$gene, order.by.ident = TRUE, slim.col.label = TRUE, remove.key = TRUE, labRow = NA)
+
+```
+
+### Save out control cell barcodes
+
+```{r save_data, cache = FALSE}
+
+saveRDS(sc, file = paste0("output/",params$script_name,"/",params$proj_name,"/sc_reclustered.RData"))
+
+save_list <- list()
+objects_to_save <- c("markrs","node_markrs","node.scores","sc.markers","sc.nodemarkers")
+
+for(x in objects_to_save) {
+    save_list[[x]] <- get(x)
+}
+
+saveRDS(save_list, file = paste0("output/",params$script_name,"/",params$proj_name,".RData"))
+
+```
+
